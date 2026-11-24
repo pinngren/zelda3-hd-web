@@ -1,0 +1,32 @@
+{
+  "name": "The Legend of Zelda: A Link to the Past HD-3D",
+  "short_name": "Zelda 3 HD-3D",
+  "description": "A Link to the Past enhanced with real-time non-pixelated 4xBRZ + 3D sculpted lighting, bloom, 2.5D diorama tilt-shift, and 16:9 widescreen.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#081510",
+  "theme_color": "#122b20",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/triforce.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

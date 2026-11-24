@@ -1,0 +1,990 @@
+shaders = 4
+
+shader0 = hd2d_pixel_lighting.glsl
+filter_linear0 = true
+wrap_mode0 = clamp_to_edge
+scale_type0 = source
+scale0 = 4.0
+
+shader1 = hd3d_bloom_h.glsl
+filter_linear1 = true
+wrap_mode1 = clamp_to_edge
+scale_type1 = source
+scale1 = 0.5
+
+shader2 = hd3d_bloom_v.glsl
+filter_linear2 = true
+wrap_mode2 = clamp_to_edge
+scale_type2 = source
+scale2 = 1.0
+
+shader3 = hd3d_composite.glsl
+filter_linear3 = true
+wrap_mode3 = clamp_to_edge
+scale_type3 = viewport
+scale3 = 1.0
+
+parameters = RELIEF_STRENGTH;SPECULAR_STRENGTH;AO_STRENGTH;BLOOM_THRESHOLD;BLOOM_STRENGTH;TILT_SHIFT_STRENGTH;COLOR_VIBRANCE;VIGNETTE_STRENGTH
+RELIEF_STRENGTH = 0.65
+SPECULAR_STRENGTH = 0.25
+AO_STRENGTH = 0.42
+BLOOM_THRESHOLD = 0.72
+BLOOM_STRENGTH = 0.45
+TILT_SHIFT_STRENGTH = 0.35
+COLOR_VIBRANCE = 0.20
+VIGNETTE_STRENGTH = 0.18
+// HD-3D Pass 6 (Final): 3D Miniature Diorama Compositor
+// Combines sculpted 3D scene (PassPrev3Texture) with atmospheric bloom (Texture),
+// applies Link's Awakening Switch-inspired 2.5D tilt-shift bokeh depth of field,
+// subtle aerial depth cueing, filmic ACES tone mapping, rich vibrance, and soft vignette.
+
+#pragma parameter BLOOM_STRENGTH "Atmospheric Bloom" 0.45 0.0 1.5 0.05
+#pragma parameter TILT_SHIFT_STRENGTH "3D Tilt-Shift Depth" 0.65 0.0 1.5 0.05
+#pragma parameter COLOR_VIBRANCE "Color Vibrance" 0.22 -0.3 0.8 0.02
+#pragma parameter VIGNETTE_STRENGTH "Cinematic Vignette" 0.22 0.0 0.8 0.02
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;           // Bloom vertical blur (previous pass)
+uniform sampler2D PassPrev3Texture;  // Sculpted 3D lit scene (3 passes prior)
+uniform vec2 PassPrev3TextureSize;
+uniform vec2 OutputSize;
+uniform float BLOOM_STRENGTH;
+uniform float TILT_SHIFT_STRENGTH;
+uniform float COLOR_VIBRANCE;
+uniform float VIGNETTE_STRENGTH;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+// Filmic ACES-inspired tone mapping curve for rich modern console dynamic range
+vec3 acesToneMap(vec3 x) {
+  const float a = 2.51;
+  const float b = 0.03;
+  const float c = 2.43;
+  const float d = 0.59;
+  const float e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+vec3 applyVibrance(vec3 col, float vibrance) {
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  float maxC = max(col.r, max(col.g, col.b));
+  float minC = min(col.r, min(col.g, col.b));
+  float sat = maxC - minC;
+  // Boost muted colors more than already-saturated colors (prevents neon clipping)
+  float boost = 1.0 + vibrance * (1.0 - sat);
+  return mix(vec3(lum), col, boost);
+}
+
+void main() {
+  vec2 uv = vTexCoord;
+  vec2 scenePx = 1.0 / max(PassPrev3TextureSize, vec2(1.0));
+
+  // 2.5D Miniature Diorama Tilt-Shift Depth of Field:
+  // Center playfield (y ~ 0.22 to 0.78) stays tack-sharp;
+  // Bottom foreground edge & upper far-horizon band soften with smooth circular bokeh.
+  // Very top HUD strip (y < 0.14) is protected so hearts, magic, rupees & item icons remain crisp!
+  float blurRadius = 0.0;
+  if (TILT_SHIFT_STRENGTH > 0.001) {
+    float bottomBlur = smoothstep(0.76, 1.0, uv.y);
+    float topHorizonBlur = smoothstep(0.30, 0.16, uv.y) * smoothstep(0.11, 0.18, uv.y);
+    float coc = max(bottomBlur * 1.0, topHorizonBlur * 0.55);
+    blurRadius = coc * TILT_SHIFT_STRENGTH * 4.5;
+  }
+
+  vec3 sceneCol;
+  if (blurRadius > 0.15) {
+    // 12-tap Golden-Angle Poisson bokeh disc for silky smooth 3D miniature lens blur
+    vec3 acc = texture(PassPrev3Texture, uv).rgb;
+    float totalW = 1.0;
+
+    vec2 disk[12];
+    disk[0]  = vec2( 0.500,  0.000);
+    disk[1]  = vec2( 0.250,  0.433);
+    disk[2]  = vec2(-0.250,  0.433);
+    disk[3]  = vec2(-0.500,  0.000);
+    disk[4]  = vec2(-0.250, -0.433);
+    disk[5]  = vec2( 0.250, -0.433);
+    disk[6]  = vec2( 0.966,  0.259);
+    disk[7]  = vec2( 0.259,  0.966);
+    disk[8]  = vec2(-0.707,  0.707);
+    disk[9]  = vec2(-0.966, -0.259);
+    disk[10] = vec2(-0.259, -0.966);
+    disk[11] = vec2( 0.707, -0.707);
+
+    vec2 rad = scenePx * blurRadius;
+    for (int i = 0; i < 12; i++) {
+      vec3 s = texture(PassPrev3Texture, clamp(uv + disk[i] * rad, vec2(0.001), vec2(0.999))).rgb;
+      // Bright highlights bloom softly in bokeh (real camera lens look)
+      float w = (i < 6 ? 1.0 : 0.78) * (1.0 + 0.35 * dot(s, vec3(0.3, 0.6, 0.1)));
+      acc += s * w;
+      totalW += w;
+    }
+    sceneCol = acc / totalW;
+  } else {
+    sceneCol = texture(PassPrev3Texture, uv).rgb;
+  }
+
+  // Add warm atmospheric bloom
+  vec3 bloom = texture(Texture, uv).rgb;
+  vec3 col = sceneCol + bloom * (BLOOM_STRENGTH * 0.75);
+
+  // Subtle aerial atmospheric depth cue at the far upper horizon (adds 3D spatial depth)
+  float horizonCue = smoothstep(0.45, 0.15, uv.y) * smoothstep(0.11, 0.18, uv.y) * clamp(TILT_SHIFT_STRENGTH, 0.0, 1.0);
+  col = mix(col, col * vec3(0.97, 0.99, 1.04) + vec3(0.015, 0.022, 0.035), horizonCue * 0.28);
+
+  // Soft filmic tone mapping (blended gently so SNES palette stays vivid and deep)
+  vec3 mapped = acesToneMap(col * 1.02);
+  col = mix(clamp(col, 0.0, 1.0), mapped, 0.42);
+
+  // Lush color vibrance
+  col = clamp(applyVibrance(col, COLOR_VIBRANCE), 0.0, 1.0);
+
+  // Soft cinematic edge vignette (very gentle so dungeons stay clear)
+  vec2 vigUV = uv * 2.0 - 1.0;
+  float vigDist = dot(vigUV * vec2(0.85, 0.95), vigUV * vec2(0.85, 0.95));
+  float vig = 1.0 - smoothstep(0.55, 1.65, vigDist) * VIGNETTE_STRENGTH;
+  col *= vig;
+
+  FragColor = vec4(col, 1.0);
+}
+
+#endif
+// 4xBRZ Edge-Directed Vector Upscaling Shader
+// Based on Zenju's xBRZ / Hyllian's xBRZ Freescale algorithm
+// Optimized with single-fetch 21-tap neighborhood & helper function for fast 60fps
+// execution across OpenGL 3.3 Core, OpenGL ES 3.0, ANGLE, and WebGL 2.0.
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+uniform vec2 InputSize;
+uniform vec2 OutputSize;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+const float EQUAL_COLOR_TOLERANCE = 30.0 / 255.0;
+const float STEEP_DIRECTION_THRESHOLD = 2.2;
+const float DOMINANT_DIRECTION_THRESHOLD = 3.6;
+const float INV_SQRT2 = 0.70710678;
+
+float DistYCbCr(vec3 pixA, vec3 pixB) {
+  const vec3 w = vec3(0.2627, 0.6780, 0.0593);
+  const float scaleB = 0.5 / (1.0 - 0.0593);
+  const float scaleR = 0.5 / (1.0 - 0.2627);
+  vec3 diff = pixA - pixB;
+  float Y = dot(diff, w);
+  float Cb = scaleB * (diff.b - Y);
+  float Cr = scaleR * (diff.r - Y);
+  return sqrt(Y * Y + Cb * Cb + Cr * Cr);
+}
+
+bool IsPixEqual(vec3 pixA, vec3 pixB) {
+  return DistYCbCr(pixA, pixB) < EQUAL_COLOR_TOLERANCE;
+}
+
+float LeftRatio(vec2 center, vec2 origin, vec2 direction, vec2 scale) {
+  vec2 P0 = center - origin;
+  vec2 proj = direction * (dot(P0, direction) / dot(direction, direction));
+  vec2 distv = P0 - proj;
+  vec2 orth = vec2(-direction.y, direction.x);
+  float side = sign(dot(P0, orth));
+  float v = side * length(distv * scale);
+  return smoothstep(-INV_SQRT2, INV_SQRT2, v);
+}
+
+int DetectCorner(vec3 p0, vec3 p1, vec3 p2, vec3 p3,
+                 vec3 diagA, vec3 diagB, vec3 diagC, vec3 diagD,
+                 vec3 altA, vec3 altB, vec3 altC, vec3 altD) {
+  // Returns 0 = none, 1 = normal blend, 2 = dominant blend
+  if ((p0 == p1 && p2 == p3) || (p0 == p2 && p1 == p3))
+    return 0;
+  float distDiag = DistYCbCr(diagA, diagB) + DistYCbCr(diagB, diagC) +
+                   DistYCbCr(diagD, p3) + DistYCbCr(p3, altD) + 4.0 * DistYCbCr(p2, p1);
+  float distMain = DistYCbCr(altA, p2) + DistYCbCr(p2, altB) +
+                   DistYCbCr(altC, p1) + DistYCbCr(p1, diagC) + 4.0 * DistYCbCr(p0, p3);
+  if (!(distDiag < distMain && p0 != p1 && p0 != p2))
+    return 0;
+  return (DOMINANT_DIRECTION_THRESHOLD * distDiag < distMain) ? 2 : 1;
+}
+
+vec3 BlendCorner(vec3 dst, vec3 E, vec3 side1, vec3 side2, vec3 opp1, vec3 opp2,
+                 vec3 outer1, vec3 outer2, vec3 cornerPx,
+                 int brSelf, int brAdj1, int brAdj2,
+                 vec2 pos, vec2 baseOrigin, vec2 baseDir, vec2 shallowOrigin,
+                 vec2 steepOrigin, vec2 shallowDirAdd, vec2 steepDirAdd, vec2 scale) {
+  if (brSelf == 0)
+    return dst;
+
+  float d1 = DistYCbCr(side1, opp1);
+  float d2 = DistYCbCr(side2, opp2);
+  bool doLineBlend = (brSelf == 2) ||
+    !((brAdj1 != 0 && !IsPixEqual(E, opp1)) ||
+      (brAdj2 != 0 && !IsPixEqual(E, opp2)) ||
+      (IsPixEqual(opp1, side2) && IsPixEqual(side2, cornerPx) &&
+       IsPixEqual(cornerPx, side1) && IsPixEqual(side1, opp2) && !IsPixEqual(E, cornerPx)));
+
+  vec2 origin = baseOrigin;
+  vec2 dir = baseDir;
+  if (doLineBlend) {
+    bool shallow = (STEEP_DIRECTION_THRESHOLD * d1 <= d2) && (E != opp1) && (outer1 != opp1);
+    bool steep   = (STEEP_DIRECTION_THRESHOLD * d2 <= d1) && (E != opp2) && (outer2 != opp2);
+    origin = shallow ? shallowOrigin : steepOrigin;
+    if (shallow) dir += shallowDirAdd;
+    if (steep)   dir += steepDirAdd;
+  }
+
+  vec3 blendPix = mix(side2, side1, step(DistYCbCr(E, side1), DistYCbCr(E, side2)));
+  return mix(dst, blendPix, LeftRatio(pos, origin, dir, scale));
+}
+
+void main() {
+  vec2 invSize = 1.0 / max(TextureSize, vec2(1.0));
+  vec2 scale = max(OutputSize / max(InputSize, vec2(1.0)), vec2(1.0));
+  vec2 pos = fract(vTexCoord * TextureSize) - vec2(0.5);
+  vec2 coord = vTexCoord - pos * invSize;
+
+  // Fetch 5x5 neighborhood (21 taps) once
+  vec3 A1 = texture(Texture, coord + vec2(-1.0, -2.0) * invSize).rgb;
+  vec3 B1 = texture(Texture, coord + vec2( 0.0, -2.0) * invSize).rgb;
+  vec3 C1 = texture(Texture, coord + vec2( 1.0, -2.0) * invSize).rgb;
+
+  vec3 A0 = texture(Texture, coord + vec2(-2.0, -1.0) * invSize).rgb;
+  vec3 A  = texture(Texture, coord + vec2(-1.0, -1.0) * invSize).rgb;
+  vec3 B  = texture(Texture, coord + vec2( 0.0, -1.0) * invSize).rgb;
+  vec3 C  = texture(Texture, coord + vec2( 1.0, -1.0) * invSize).rgb;
+  vec3 C4 = texture(Texture, coord + vec2( 2.0, -1.0) * invSize).rgb;
+
+  vec3 D0 = texture(Texture, coord + vec2(-2.0,  0.0) * invSize).rgb;
+  vec3 D  = texture(Texture, coord + vec2(-1.0,  0.0) * invSize).rgb;
+  vec3 E  = texture(Texture, coord).rgb;
+  vec3 F  = texture(Texture, coord + vec2( 1.0,  0.0) * invSize).rgb;
+  vec3 F4 = texture(Texture, coord + vec2( 2.0,  0.0) * invSize).rgb;
+
+  vec3 G0 = texture(Texture, coord + vec2(-2.0,  1.0) * invSize).rgb;
+  vec3 G  = texture(Texture, coord + vec2(-1.0,  1.0) * invSize).rgb;
+  vec3 H  = texture(Texture, coord + vec2( 0.0,  1.0) * invSize).rgb;
+  vec3 I  = texture(Texture, coord + vec2( 1.0,  1.0) * invSize).rgb;
+  vec3 I4 = texture(Texture, coord + vec2( 2.0,  1.0) * invSize).rgb;
+
+  vec3 G5 = texture(Texture, coord + vec2(-1.0,  2.0) * invSize).rgb;
+  vec3 H5 = texture(Texture, coord + vec2( 0.0,  2.0) * invSize).rgb;
+  vec3 I5 = texture(Texture, coord + vec2( 1.0,  2.0) * invSize).rgb;
+
+  // Evaluate 4 corner blend states (BR=2, BL=3, TR=1, TL=0)
+  int br2 = 0, br3 = 0, br1 = 0, br0 = 0;
+
+  if (!((E == F && H == I) || (E == H && F == I))) {
+    float dist_H_F = DistYCbCr(G, E) + DistYCbCr(E, C) + DistYCbCr(H5, I) + DistYCbCr(I, F4) + 4.0 * DistYCbCr(H, F);
+    float dist_E_I = DistYCbCr(D, H) + DistYCbCr(H, I5) + DistYCbCr(B, F) + DistYCbCr(F, I4) + 4.0 * DistYCbCr(E, I);
+    if (dist_H_F < dist_E_I && E != F && E != H)
+      br2 = (DOMINANT_DIRECTION_THRESHOLD * dist_H_F < dist_E_I) ? 2 : 1;
+  }
+
+  if (!((D == E && G == H) || (D == G && E == H))) {
+    float dist_G_E = DistYCbCr(G0, D) + DistYCbCr(D, B) + DistYCbCr(G5, H) + DistYCbCr(H, F) + 4.0 * DistYCbCr(G, E);
+    float dist_D_H = DistYCbCr(D0, G) + DistYCbCr(G, H5) + DistYCbCr(A, E) + DistYCbCr(E, I) + 4.0 * DistYCbCr(D, H);
+    if (dist_G_E > dist_D_H && E != D && E != H)
+      br3 = (DOMINANT_DIRECTION_THRESHOLD * dist_D_H < dist_G_E) ? 2 : 1;
+  }
+
+  if (!((B == C && E == F) || (B == E && C == F))) {
+    float dist_E_C = DistYCbCr(D, B) + DistYCbCr(B, C1) + DistYCbCr(H, F) + DistYCbCr(F, C4) + 4.0 * DistYCbCr(E, C);
+    float dist_B_F = DistYCbCr(A, E) + DistYCbCr(E, I) + DistYCbCr(B1, C) + DistYCbCr(C, F4) + 4.0 * DistYCbCr(B, F);
+    if (dist_E_C > dist_B_F && E != B && E != F)
+      br1 = (DOMINANT_DIRECTION_THRESHOLD * dist_B_F < dist_E_C) ? 2 : 1;
+  }
+
+  if (!((A == B && D == E) || (A == D && B == E))) {
+    float dist_D_B = DistYCbCr(D0, A) + DistYCbCr(A, B1) + DistYCbCr(G, E) + DistYCbCr(E, C) + 4.0 * DistYCbCr(D, B);
+    float dist_A_E = DistYCbCr(A0, D) + DistYCbCr(D, H) + DistYCbCr(A1, B) + DistYCbCr(B, F) + 4.0 * DistYCbCr(A, E);
+    if (dist_D_B < dist_A_E && E != D && E != B)
+      br0 = (DOMINANT_DIRECTION_THRESHOLD * dist_D_B < dist_A_E) ? 2 : 1;
+  }
+
+  vec3 dst = E;
+
+  // Bottom-Right corner
+  dst = BlendCorner(dst, E, F, H, G, C, D, B, I, br2, br1, br3,
+                    pos, vec2(0.0, INV_SQRT2), vec2(1.0, -1.0),
+                    vec2(0.0, 0.25), vec2(0.0, 0.5), vec2(1.0, 0.0), vec2(0.0, -1.0), scale);
+  // Bottom-Left corner
+  dst = BlendCorner(dst, E, D, H, A, I, B, F, G, br3, br2, br0,
+                    pos, vec2(-INV_SQRT2, 0.0), vec2(1.0, 1.0),
+                    vec2(-0.25, 0.0), vec2(-0.5, 0.0), vec2(0.0, 1.0), vec2(1.0, 0.0), scale);
+  // Top-Right corner
+  dst = BlendCorner(dst, E, F, B, I, A, H, D, C, br1, br0, br2,
+                    pos, vec2(INV_SQRT2, 0.0), vec2(-1.0, -1.0),
+                    vec2(0.25, 0.0), vec2(0.5, 0.0), vec2(0.0, -1.0), vec2(-1.0, 0.0), scale);
+  // Top-Left corner
+  dst = BlendCorner(dst, E, D, B, C, G, F, H, A, br0, br3, br1,
+                    pos, vec2(0.0, -INV_SQRT2), vec2(-1.0, 1.0),
+                    vec2(0.0, -0.25), vec2(0.0, -0.5), vec2(-1.0, 0.0), vec2(0.0, 1.0), scale);
+
+  FragColor = vec4(dst, 1.0);
+}
+
+#endif
+shaders = 6
+
+shader0 = xbrz_4x.glsl
+filter_linear0 = false
+wrap_mode0 = clamp_to_edge
+scale_type0 = source
+scale0 = 4.0
+
+shader1 = hd3d_smooth.glsl
+filter_linear1 = true
+wrap_mode1 = clamp_to_edge
+scale_type1 = source
+scale1 = 1.0
+
+shader2 = hd3d_lighting.glsl
+filter_linear2 = true
+wrap_mode2 = clamp_to_edge
+scale_type2 = source
+scale2 = 1.0
+
+shader3 = hd3d_bloom_h.glsl
+filter_linear3 = true
+wrap_mode3 = clamp_to_edge
+scale_type3 = source
+scale3 = 0.5
+
+shader4 = hd3d_bloom_v.glsl
+filter_linear4 = true
+wrap_mode4 = clamp_to_edge
+scale_type4 = source
+scale4 = 1.0
+
+shader5 = hd3d_composite.glsl
+filter_linear5 = true
+wrap_mode5 = clamp_to_edge
+scale_type5 = viewport
+scale5 = 1.0
+
+parameters = SMOOTH_STRENGTH;RELIEF_STRENGTH;SPECULAR_STRENGTH;AO_STRENGTH;BLOOM_THRESHOLD;BLOOM_STRENGTH;TILT_SHIFT_STRENGTH;COLOR_VIBRANCE;VIGNETTE_STRENGTH
+SMOOTH_STRENGTH = 0.75
+RELIEF_STRENGTH = 0.00
+SPECULAR_STRENGTH = 0.00
+AO_STRENGTH = 0.00
+BLOOM_THRESHOLD = 0.78
+BLOOM_STRENGTH = 0.16
+TILT_SHIFT_STRENGTH = 0.00
+COLOR_VIBRANCE = 0.18
+VIGNETTE_STRENGTH = 0.06
+// HD-3D Pass 4: Half-Resolution Horizontal Atmospheric Bloom Blur
+// Extracts glowing emissive highlights (stored in alpha from lighting pass) and blurs horizontally.
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+vec3 sampleGlow(vec2 uv) {
+  vec4 c = texture(Texture, uv);
+  // Multiply RGB by the emissive glow mask stored in alpha
+  return c.rgb * c.a;
+}
+
+void main() {
+  vec2 stepX = vec2(2.4 / TextureSize.x, 0.0);
+
+  // 9-tap wide Gaussian kernel
+  vec3 sum = sampleGlow(vTexCoord) * 0.227027;
+  sum += (sampleGlow(vTexCoord + stepX * 1.0) + sampleGlow(vTexCoord - stepX * 1.0)) * 0.1945946;
+  sum += (sampleGlow(vTexCoord + stepX * 2.0) + sampleGlow(vTexCoord - stepX * 2.0)) * 0.1216216;
+  sum += (sampleGlow(vTexCoord + stepX * 3.0) + sampleGlow(vTexCoord - stepX * 3.0)) * 0.054054;
+  sum += (sampleGlow(vTexCoord + stepX * 4.0) + sampleGlow(vTexCoord - stepX * 4.0)) * 0.016216;
+
+  FragColor = vec4(sum, 1.0);
+}
+
+#endif
+shaders = 1
+
+shader0 = crt_glow.glsl
+filter_linear0 = true
+wrap_mode0 = clamp_to_edge
+scale_type0 = viewport
+scale0 = 1.0
+
+parameters = CRT_CURVATURE;SCANLINE_STRENGTH;MASK_STRENGTH
+CRT_CURVATURE = 0.08
+SCANLINE_STRENGTH = 0.35
+MASK_STRENGTH = 0.18
+// HD-2D Crisp Pixel-Art + 3D Sculpted Lighting & Emissive Mask
+// Combines sharp-bilinear pixel scaling with subtle 3D bevel relief, contact shadows, and bloom extraction.
+
+#pragma parameter RELIEF_STRENGTH "3D Relief Depth" 0.65 0.0 2.0 0.05
+#pragma parameter SPECULAR_STRENGTH "3D Gloss & Specular" 0.25 0.0 1.5 0.05
+#pragma parameter AO_STRENGTH "3D Contact Shadows (AO)" 0.40 0.0 1.5 0.05
+#pragma parameter BLOOM_THRESHOLD "Bloom Threshold" 0.72 0.3 0.98 0.02
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+uniform vec2 OutputSize;
+uniform float RELIEF_STRENGTH;
+uniform float SPECULAR_STRENGTH;
+uniform float AO_STRENGTH;
+uniform float BLOOM_THRESHOLD;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+float luma(vec3 c) {
+  return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// Sharp-bilinear sampling keeps crisp non-shimmering pixel edges at any non-integer resolution
+vec2 sharpUV(vec2 uv, vec2 texSize, vec2 outSize) {
+  vec2 scale = max(floor(outSize / texSize), vec2(1.0));
+  vec2 texel = uv * texSize;
+  vec2 texelFloor = floor(texel);
+  vec2 f = texel - texelFloor;
+  vec2 regionRange = 0.5 - 0.5 / scale;
+  vec2 centerDist = f - 0.5;
+  vec2 fSharp = (centerDist - clamp(centerDist, -regionRange, regionRange)) * scale + 0.5;
+  return (texelFloor + fSharp) / texSize;
+}
+
+float heightAt(vec2 uv) {
+  vec3 c = texture(Texture, uv).rgb;
+  float l = luma(c);
+  return l * smoothstep(0.03, 0.18, l);
+}
+
+void main() {
+  vec2 sUV = sharpUV(vTexCoord, TextureSize, OutputSize);
+  vec3 albedo = texture(Texture, sUV).rgb;
+  vec2 px = 1.0 / TextureSize;
+
+  float hudMask = smoothstep(0.11, 0.17, vTexCoord.y);
+  float hC = heightAt(sUV);
+  float hL = heightAt(vTexCoord + vec2(-px.x, 0.0));
+  float hR = heightAt(vTexCoord + vec2( px.x, 0.0));
+  float hT = heightAt(vTexCoord + vec2( 0.0, -px.y));
+  float hB = heightAt(vTexCoord + vec2( 0.0,  px.y));
+  float hTL = heightAt(vTexCoord + vec2(-px.x, -px.y));
+
+  float gx = hR - hL;
+  float gy = hB - hT;
+  vec3 N = normalize(vec3(-gx * RELIEF_STRENGTH * 2.0 * hudMask, -gy * RELIEF_STRENGTH * 2.0 * hudMask, 1.0));
+  vec3 L = normalize(vec3(-0.48, -0.62, 0.78));
+  vec3 Hvec = normalize(L + vec3(0.0, 0.0, 1.0));
+
+  float wrapDiff = clamp((dot(N, L) + 0.45) / 1.45, 0.0, 1.0);
+  vec3 hemi = mix(vec3(0.80, 0.85, 0.95), vec3(1.08, 1.04, 0.96), wrapDiff);
+  float spec = pow(max(dot(N, Hvec), 0.0), 18.0) * SPECULAR_STRENGTH * hudMask * 0.55;
+  float avgH = (hL + hR + hT + hB) * 0.25;
+  float ao = 1.0 - clamp(((avgH - hC) * 1.6 + max(hTL - hC, 0.0) * 0.9) * AO_STRENGTH * hudMask, 0.0, 0.40);
+
+  vec3 lit = albedo * hemi * ao * 1.04 + vec3(1.0, 0.97, 0.90) * spec;
+
+  float lum = luma(albedo);
+  float maxC = max(albedo.r, max(albedo.g, albedo.b));
+  float minC = min(albedo.r, min(albedo.g, albedo.b));
+  float sat = (maxC > 0.001) ? (maxC - minC) / maxC : 0.0;
+  float bloomMask = clamp(smoothstep(BLOOM_THRESHOLD, 1.0, lum + albedo.r * sat * 0.2) * mix(0.25, 1.0, hudMask), 0.0, 1.0);
+
+  FragColor = vec4(clamp(lit, 0.0, 1.5), bloomMask);
+}
+
+#endif
+// Retro CRT Glow Shader (Curved Glass + Aperture Grille + Scanlines + Halation)
+// Compatible with OpenGL 3.3 Core, OpenGL ES 3.0, and WebGL 2.0
+
+#pragma parameter CRT_CURVATURE "CRT Curvature" 0.08 0.0 0.25 0.01
+#pragma parameter SCANLINE_STRENGTH "Scanline Strength" 0.35 0.0 0.8 0.05
+#pragma parameter MASK_STRENGTH "Phosphor Mask" 0.18 0.0 0.5 0.02
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+uniform vec2 OutputSize;
+uniform float CRT_CURVATURE;
+uniform float SCANLINE_STRENGTH;
+uniform float MASK_STRENGTH;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+vec2 curveUV(vec2 uv) {
+  vec2 cc = uv * 2.0 - 1.0;
+  vec2 offset = cc.yx * cc.yx * CRT_CURVATURE;
+  cc += cc * offset;
+  return cc * 0.5 + 0.5;
+}
+
+void main() {
+  vec2 uv = curveUV(vTexCoord);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  vec2 px = 1.0 / TextureSize;
+  // Slight RGB convergence & warm halation
+  float r = texture(Texture, uv + vec2( px.x * 0.18, 0.0)).r;
+  float g = texture(Texture, uv).g;
+  float b = texture(Texture, uv + vec2(-px.x * 0.18, 0.0)).b;
+  vec3 col = vec3(r, g, b);
+
+  // Subtle phosphor halation glow
+  vec3 glow = (
+    texture(Texture, uv + vec2( px.x, 0.0)).rgb +
+    texture(Texture, uv + vec2(-px.x, 0.0)).rgb +
+    texture(Texture, uv + vec2(0.0,  px.y)).rgb +
+    texture(Texture, uv + vec2(0.0, -px.y)).rgb
+  ) * 0.25;
+  col = mix(col, max(col, glow), 0.25);
+
+  // Scanlines synchronized to SNES vertical resolution
+  float scan = sin(uv.y * TextureSize.y * 3.14159265 * 2.0);
+  float scanFactor = 1.0 - SCANLINE_STRENGTH * (0.5 - 0.5 * scan);
+  col *= scanFactor;
+
+  // Aperture grille subpixel mask
+  float grille = sin(gl_FragCoord.x * 3.14159265);
+  col *= 1.0 - MASK_STRENGTH * (0.5 - 0.5 * grille);
+
+  // Boost brightness slightly to compensate for scanlines & mask
+  col *= 1.18;
+
+  // Soft bezel vignette
+  vec2 vig = uv * (1.0 - uv);
+  float edge = clamp(pow(vig.x * vig.y * 20.0, 0.18), 0.0, 1.0);
+  col *= edge;
+
+  FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+
+#endif
+shaders = 6
+
+shader0 = xbrz_4x.glsl
+filter_linear0 = false
+wrap_mode0 = clamp_to_edge
+scale_type0 = source
+scale0 = 4.0
+
+shader1 = hd3d_smooth.glsl
+filter_linear1 = true
+wrap_mode1 = clamp_to_edge
+scale_type1 = source
+scale1 = 1.0
+
+shader2 = hd3d_lighting.glsl
+filter_linear2 = true
+wrap_mode2 = clamp_to_edge
+scale_type2 = source
+scale2 = 1.0
+
+shader3 = hd3d_bloom_h.glsl
+filter_linear3 = true
+wrap_mode3 = clamp_to_edge
+scale_type3 = source
+scale3 = 0.5
+
+shader4 = hd3d_bloom_v.glsl
+filter_linear4 = true
+wrap_mode4 = clamp_to_edge
+scale_type4 = source
+scale4 = 1.0
+
+shader5 = hd3d_composite.glsl
+filter_linear5 = true
+wrap_mode5 = clamp_to_edge
+scale_type5 = viewport
+scale5 = 1.0
+
+parameters = SMOOTH_STRENGTH;RELIEF_STRENGTH;SPECULAR_STRENGTH;AO_STRENGTH;BLOOM_THRESHOLD;BLOOM_STRENGTH;TILT_SHIFT_STRENGTH;COLOR_VIBRANCE;VIGNETTE_STRENGTH
+SMOOTH_STRENGTH = 0.85
+RELIEF_STRENGTH = 1.10
+SPECULAR_STRENGTH = 0.36
+AO_STRENGTH = 0.58
+BLOOM_THRESHOLD = 0.82
+BLOOM_STRENGTH = 0.38
+TILT_SHIFT_STRENGTH = 0.60
+COLOR_VIBRANCE = 0.24
+VIGNETTE_STRENGTH = 0.18
+// HD-3D Pass 3: 3D Sculpted Normal-Map Relief, Directional Sunlight, Specular Sheen,
+// Crevice Ambient Occlusion, Rim Highlight, and Emissive Bloom Mask
+// Produces a sculpted Link's Awakening (Switch) / HD-2D 3D diorama material feel.
+
+#pragma parameter RELIEF_STRENGTH "3D Relief Depth" 1.00 0.0 2.5 0.05
+#pragma parameter SPECULAR_STRENGTH "3D Gloss & Specular" 0.42 0.0 1.5 0.05
+#pragma parameter AO_STRENGTH "3D Contact Shadows (AO)" 0.55 0.0 1.5 0.05
+#pragma parameter BLOOM_THRESHOLD "Bloom Threshold" 0.72 0.3 0.98 0.02
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+uniform int FrameCount;
+uniform float RELIEF_STRENGTH;
+uniform float SPECULAR_STRENGTH;
+uniform float AO_STRENGTH;
+uniform float BLOOM_THRESHOLD;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+float sampleH(vec2 uv) {
+  return texture(Texture, uv).a;
+}
+
+void main() {
+  vec2 px = 1.0 / TextureSize;
+  vec4 center = texture(Texture, vTexCoord);
+  vec3 albedo = center.rgb;
+  float hC = center.a;
+
+  // Protect the very top HUD bar (top ~15% of screen where hearts/rupees/item frame sit)
+  // so HUD elements get clean mild bevel without harsh shadowing
+  float hudMask = smoothstep(0.11, 0.17, vTexCoord.y);
+  float effectiveRelief = RELIEF_STRENGTH * mix(0.28, 1.0, hudMask);
+  float effectiveAO = AO_STRENGTH * mix(0.25, 1.0, hudMask);
+
+  // Fine Sobel gradient (1.5 px) for crisp beveled edges & sculpted stone/sprite contours
+  vec2 s1 = px * 1.5;
+  float tl1 = sampleH(vTexCoord + vec2(-s1.x, -s1.y));
+  float t1  = sampleH(vTexCoord + vec2(  0.0, -s1.y));
+  float tr1 = sampleH(vTexCoord + vec2( s1.x, -s1.y));
+  float l1  = sampleH(vTexCoord + vec2(-s1.x,   0.0));
+  float r1  = sampleH(vTexCoord + vec2( s1.x,   0.0));
+  float bl1 = sampleH(vTexCoord + vec2(-s1.x,  s1.y));
+  float b1  = sampleH(vTexCoord + vec2(  0.0,  s1.y));
+  float br1 = sampleH(vTexCoord + vec2( s1.x,  s1.y));
+
+  float gx1 = (tr1 + 2.0 * r1 + br1) - (tl1 + 2.0 * l1 + bl1);
+  float gy1 = (bl1 + 2.0 * b1 + br1) - (tl1 + 2.0 * t1 + tr1);
+
+  // Broad Sobel gradient (4.5 px) for rounded, plump 3D volumetric shading on trees, Link, roofs, rocks
+  vec2 s2 = px * 4.5;
+  float t2 = sampleH(vTexCoord + vec2(  0.0, -s2.y));
+  float b2 = sampleH(vTexCoord + vec2(  0.0,  s2.y));
+  float l2 = sampleH(vTexCoord + vec2(-s2.x,   0.0));
+  float r2 = sampleH(vTexCoord + vec2( s2.x,   0.0));
+  float tl2 = sampleH(vTexCoord + vec2(-s2.x, -s2.y));
+  float tr2 = sampleH(vTexCoord + vec2( s2.x, -s2.y));
+  float bl2 = sampleH(vTexCoord + vec2(-s2.x,  s2.y));
+  float br2 = sampleH(vTexCoord + vec2( s2.x,  s2.y));
+
+  float gx2 = (tr2 + 2.0 * r2 + br2) - (tl2 + 2.0 * l2 + bl2);
+  float gy2 = (bl2 + 2.0 * b2 + br2) - (tl2 + 2.0 * t2 + tr2);
+
+  // Combine fine bevel + broad volume normals
+  float gx = gx1 * 0.55 + gx2 * 0.75;
+  float gy = gy1 * 0.55 + gy2 * 0.75;
+
+  vec3 N = normalize(vec3(-gx * effectiveRelief * 1.45, -gy * effectiveRelief * 1.45, 1.0));
+
+  // Directional warm golden sun from upper-left + camera view vector
+  vec3 L = normalize(vec3(-0.48, -0.62, 0.78));
+  vec3 V = vec3(0.0, 0.0, 1.0);
+  vec3 Hvec = normalize(L + V);
+
+  // Wrapped diffuse lighting (soft 3D sculpting without crushing shadows)
+  float ndotl = dot(N, L);
+  float wrapDiff = clamp((ndotl + 0.42) / 1.42, 0.0, 1.0);
+
+  // Hemisphere lighting: warm sunlit highlights vs cool ambient sky shadows
+  vec3 sunColor = vec3(1.08, 1.04, 0.96);
+  vec3 skyShadow = vec3(0.76, 0.82, 0.94);
+  vec3 hemiLight = mix(skyShadow, sunColor, wrapDiff);
+
+  // Glossy diorama Blinn-Phong specular highlight (subtle ceramic/toy sheen on metals, water, leaves, Link)
+  float specBase = pow(max(dot(N, Hvec), 0.0), 22.0);
+  float specBroad = pow(max(dot(N, Hvec), 0.0), 6.0) * 0.16;
+
+  // Detect water/blue/crystal/gold surfaces for slightly richer glossy sheen
+  float waterHint = smoothstep(0.12, 0.35, albedo.b - max(albedo.r, albedo.g) * 0.65);
+  float shimmer = 1.0 + 0.15 * waterHint * sin(float(FrameCount) * 0.08 + vTexCoord.x * 60.0 + vTexCoord.y * 40.0);
+  float specAmount = (specBase * 0.62 + specBroad) * SPECULAR_STRENGTH * mix(0.3, 1.0, hudMask) * (0.65 + 0.55 * hC) * shimmer;
+
+  // Rim / Fresnel edge glow to lift 3D silhouettes cleanly off the ground
+  float fresnel = pow(1.0 - clamp(N.z, 0.0, 1.0), 2.4);
+  vec3 rimGlow = vec3(1.0, 0.96, 0.88) * fresnel * 0.18 * effectiveRelief * smoothstep(0.25, 0.75, hC);
+
+  // Screen-space Crevice Ambient Occlusion (SSAO-lite)
+  // Compares local height against broader neighborhood average; recessed areas get grounded contact shadows
+  float avgH = (t2 + b2 + l2 + r2 + tl2 + tr2 + bl2 + br2) * 0.125;
+  float crevice = clamp((avgH - hC) * 2.4, 0.0, 1.0);
+  // Subtle directional drop shadow cast toward bottom-right from taller upper-left neighbors
+  float castShadow = clamp((tl2 * 0.55 + t2 * 0.25 + l2 * 0.20 - hC) * 1.65, 0.0, 1.0);
+  float ao = 1.0 - clamp((crevice * 0.58 + castShadow * 0.42) * effectiveAO, 0.0, 0.48);
+
+  // Blend lit 3D material with original albedo (when RELIEF_STRENGTH == 0, stays clean)
+  float litBlend = clamp(effectiveRelief, 0.0, 1.0);
+  vec3 litColor = albedo * mix(vec3(1.0), hemiLight * ao * 1.06, litBlend)
+                + sunColor * specAmount
+                + rimGlow;
+
+  // Compute emissive / bright highlight mask for atmospheric bloom pass (torches, fire, magic, lanterns, Triforce)
+  float lum = dot(albedo, vec3(0.299, 0.587, 0.114));
+  float maxC = max(albedo.r, max(albedo.g, albedo.b));
+  float minC = min(albedo.r, min(albedo.g, albedo.b));
+  float sat = (maxC > 0.001) ? (maxC - minC) / maxC : 0.0;
+  // Warm fire/gold/magic tones glow even more invitingly
+  float fireBoost = smoothstep(0.45, 0.85, albedo.r) * smoothstep(0.25, 0.70, sat) * 0.22;
+  float bloomMask = clamp(smoothstep(BLOOM_THRESHOLD, 1.0, lum + fireBoost) * mix(0.25, 1.0, hudMask), 0.0, 1.0);
+
+  FragColor = vec4(clamp(litColor, 0.0, 1.5), bloomMask);
+}
+
+#endif
+shaders = 6
+
+shader0 = xbrz_4x.glsl
+filter_linear0 = false
+wrap_mode0 = clamp_to_edge
+scale_type0 = source
+scale0 = 4.0
+
+shader1 = hd3d_smooth.glsl
+filter_linear1 = true
+wrap_mode1 = clamp_to_edge
+scale_type1 = source
+scale1 = 1.0
+
+shader2 = hd3d_lighting.glsl
+filter_linear2 = true
+wrap_mode2 = clamp_to_edge
+scale_type2 = source
+scale2 = 1.0
+
+shader3 = hd3d_bloom_h.glsl
+filter_linear3 = true
+wrap_mode3 = clamp_to_edge
+scale_type3 = source
+scale3 = 0.5
+
+shader4 = hd3d_bloom_v.glsl
+filter_linear4 = true
+wrap_mode4 = clamp_to_edge
+scale_type4 = source
+scale4 = 1.0
+
+shader5 = hd3d_composite.glsl
+filter_linear5 = true
+wrap_mode5 = clamp_to_edge
+scale_type5 = viewport
+scale5 = 1.0
+
+parameters = SMOOTH_STRENGTH;RELIEF_STRENGTH;SPECULAR_STRENGTH;AO_STRENGTH;BLOOM_THRESHOLD;BLOOM_STRENGTH;TILT_SHIFT_STRENGTH;COLOR_VIBRANCE;VIGNETTE_STRENGTH
+SMOOTH_STRENGTH = 0.80
+RELIEF_STRENGTH = 1.05
+SPECULAR_STRENGTH = 0.34
+AO_STRENGTH = 0.52
+BLOOM_THRESHOLD = 0.82
+BLOOM_STRENGTH = 0.35
+TILT_SHIFT_STRENGTH = 0.00
+COLOR_VIBRANCE = 0.22
+VIGNETTE_STRENGTH = 0.14
+// HD-3D Pass 2: Edge-Preserving Painterly Bilateral Smoothing + 3D Surface Height Estimation
+// Removes SNES checkerboard dithering and micro-staircasing while preserving sharp outlines,
+// and packs a perceptual 3D surface elevation heightmap into the alpha channel.
+
+#pragma parameter SMOOTH_STRENGTH "Painterly Smoothing" 0.80 0.0 1.5 0.05
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+uniform float SMOOTH_STRENGTH;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+float luma(vec3 c) {
+  return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+  vec2 px = 1.0 / TextureSize;
+  vec3 center = texture(Texture, vTexCoord).rgb;
+
+  // Edge-preserving bilateral filter across a 5x5 kernel (sparse 13-tap diamond/cross for 60fps speed)
+  float sigmaColor = mix(0.06, 0.22, clamp(SMOOTH_STRENGTH, 0.0, 1.5) / 1.5);
+  float invSigmaColor2 = 1.0 / max(2.0 * sigmaColor * sigmaColor, 0.0001);
+
+  vec3 accum = center * 1.4;
+  float weightSum = 1.4;
+
+  // Ring 1 (distance 1.0 - 1.41)
+  vec2 off1[8];
+  off1[0] = vec2(-1.0,  0.0);
+  off1[1] = vec2( 1.0,  0.0);
+  off1[2] = vec2( 0.0, -1.0);
+  off1[3] = vec2( 0.0,  1.0);
+  off1[4] = vec2(-1.0, -1.0);
+  off1[5] = vec2( 1.0, -1.0);
+  off1[6] = vec2(-1.0,  1.0);
+  off1[7] = vec2( 1.0,  1.0);
+
+  for (int i = 0; i < 8; i++) {
+    vec3 s = texture(Texture, vTexCoord + off1[i] * px).rgb;
+    vec3 d = s - center;
+    float dist2 = dot(d, d);
+    float spatial = (i < 4) ? 0.85 : 0.65;
+    float w = spatial * exp(-dist2 * invSigmaColor2);
+    accum += s * w;
+    weightSum += w;
+  }
+
+  // Ring 2 (distance 2.0 - breaks up SNES 2x2 dither smoothly)
+  vec2 off2[4];
+  off2[0] = vec2(-2.0,  0.0);
+  off2[1] = vec2( 2.0,  0.0);
+  off2[2] = vec2( 0.0, -2.0);
+  off2[3] = vec2( 0.0,  2.0);
+
+  for (int i = 0; i < 4; i++) {
+    vec3 s = texture(Texture, vTexCoord + off2[i] * px).rgb;
+    vec3 d = s - center;
+    float dist2 = dot(d, d);
+    float w = 0.45 * exp(-dist2 * invSigmaColor2 * 1.15);
+    accum += s * w;
+    weightSum += w;
+  }
+
+  vec3 smoothCol = mix(center, accum / weightSum, clamp(SMOOTH_STRENGTH, 0.0, 1.0));
+
+  // Estimate perceptual 3D surface elevation height in [0, 1]
+  // Brighter lit tops, warm highlights, and saturated foreground objects read as higher;
+  // dark outlines, deep shadows, and cool recessed blues read as lower.
+  float lum = luma(smoothCol);
+  float maxC = max(smoothCol.r, max(smoothCol.g, smoothCol.b));
+  float minC = min(smoothCol.r, min(smoothCol.g, smoothCol.b));
+  float sat = (maxC > 0.001) ? (maxC - minC) / maxC : 0.0;
+  float warmth = clamp((smoothCol.r * 0.6 + smoothCol.g * 0.4) - smoothCol.b * 0.65, -0.5, 0.5);
+
+  float height = clamp(lum * 0.78 + sat * 0.14 + warmth * 0.12 + 0.04, 0.0, 1.0);
+  // Dark black outlines/crevices drop sharply to create sculpted 3D bevels around sprites & tiles
+  height *= smoothstep(0.03, 0.18, lum);
+
+  FragColor = vec4(smoothCol, height);
+}
+
+#endif
+// HD-3D Pass 5: Half-Resolution Vertical Atmospheric Bloom Blur
+
+#if defined(VERTEX)
+
+uniform mat4 MVPMatrix;
+in vec2 VertexCoord;
+in vec2 TexCoord;
+out vec2 vTexCoord;
+
+void main() {
+  gl_Position = MVPMatrix * vec4(VertexCoord, 0.0, 1.0);
+  vTexCoord = TexCoord;
+}
+
+#elif defined(FRAGMENT)
+
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+in vec2 vTexCoord;
+out vec4 FragColor;
+
+void main() {
+  vec2 stepY = vec2(0.0, 2.4 / TextureSize.y);
+
+  vec3 sum = texture(Texture, vTexCoord).rgb * 0.227027;
+  sum += (texture(Texture, vTexCoord + stepY * 1.0).rgb + texture(Texture, vTexCoord - stepY * 1.0).rgb) * 0.1945946;
+  sum += (texture(Texture, vTexCoord + stepY * 2.0).rgb + texture(Texture, vTexCoord - stepY * 2.0).rgb) * 0.1216216;
+  sum += (texture(Texture, vTexCoord + stepY * 3.0).rgb + texture(Texture, vTexCoord - stepY * 3.0).rgb) * 0.054054;
+  sum += (texture(Texture, vTexCoord + stepY * 4.0).rgb + texture(Texture, vTexCoord - stepY * 4.0).rgb) * 0.016216;
+
+  FragColor = vec4(sum, 1.0);
+}
+
+#endif
