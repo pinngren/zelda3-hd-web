@@ -33,6 +33,7 @@
         </div>
         <div class="cached-actions">
           <button id="btn-play-cached" class="btn btn-primary btn-lg">Play Now</button>
+          <button id="btn-download-dat" class="btn btn-ghost btn-sm" title="Download extracted zelda3_assets.dat">Save .dat</button>
           <button id="btn-clear-cached" class="btn btn-ghost btn-sm" title="Replace game assets">Change</button>
         </div>
       </div>
@@ -40,10 +41,10 @@
       <!-- Drop Zone -->
       <div id="drop-zone" class="drop-zone">
         <div class="drop-icon">&#9650;</div>
-        <div class="drop-title">Drop <code>zelda3_assets.dat</code> here</div>
-        <div class="drop-sub">or click to browse files on your Chromebook (saved locally for offline play)</div>
-        <div class="drop-sub-small">Also supports dropping a custom Link <code>.zspr</code> sprite file!</div>
-        <input id="file-input" type="file" accept=".dat,.zspr,.bps,.sfc,.smc" multiple hidden>
+        <div class="drop-title">Drop your <code>zelda3.sfc</code> ROM or <code>zelda3_assets.dat</code> here</div>
+        <div class="drop-sub">Click to browse files on your Chromebook — ROM extraction runs 100% locally in your browser and is saved for offline play!</div>
+        <div class="drop-sub-small">Accepts US <code>.sfc</code> / <code>.smc</code> ROM, pre-extracted <code>zelda3_assets.dat</code>, or custom Link <code>.zspr</code> sprites</div>
+        <input id="file-input" type="file" accept=".sfc,.smc,.dat,.zspr,.bps" multiple hidden>
       </div>
 
       <!-- Pre-launch Quick Options -->
@@ -68,14 +69,14 @@
       <div class="setup-footer">
         <button id="btn-install-pwa" class="btn btn-gold hidden">Install App on Chromebook</button>
         <details class="help-details">
-          <summary>How do I get <code>zelda3_assets.dat</code> from my ROM?</summary>
+          <summary>Why isn't <code>zelda3_assets.dat</code> included in the GitHub repo?</summary>
           <p>
-            For copyright reasons, game assets are extracted from your own US copy of
-            <em>The Legend of Zelda: A Link to the Past</em> (<code>zelda3.sfc</code>).
-            On Linux / Chromebook Linux / macOS / Windows, place <code>zelda3.sfc</code> in the project folder and run:
+            For copyright reasons, Nintendo's game sprites, levels, and music are not stored in Git.
+            Simply drop your own US copy of <em>The Legend of Zelda: A Link to the Past</em>
+            (<code>zelda3.sfc</code> or <code>zelda3.smc</code>) into the box above — this app extracts
+            <code>zelda3_assets.dat</code> automatically right inside your Chromebook browser (your ROM never leaves your device)
+            and caches it permanently for offline play!
           </p>
-          <pre>python3 assets/restool.py --extract-from-rom</pre>
-          <p>Then drop the generated <code>zelda3_assets.dat</code> file above — it will be cached locally in your Chromebook's storage for instant offline play.</p>
         </details>
       </div>
     </div>

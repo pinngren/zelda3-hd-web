@@ -245,6 +245,77 @@ CycleShader = F11
     }
   }
 
+  const ASSET_TOOL_FILES = [
+    'compile_music.py',
+    'compile_resources.py',
+    'decode_music.py',
+    'extract_music.py',
+    'extract_resources.py',
+    'palette_usage.bin',
+    'restool.py',
+    'sprite_sheet_info.py',
+    'sprite_sheets.py',
+    'tables.py',
+    'text_compression.py',
+    'util.py',
+  ];
+
+  let pyodidePromise = null;
+  function loadPyodideEngine() {
+    if (pyodidePromise) return pyodidePromise;
+    pyodidePromise = new Promise((resolve, reject) => {
+      if (window.loadPyodide) {
+        resolve();
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('Could not download Python extractor (check internet connection for one-time ROM extraction).'));
+      document.head.appendChild(script);
+    }).then(async () => {
+      const pyodide = await window.loadPyodide({
+        indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/',
+      });
+      await pyodide.loadPackage(['pillow', 'pyyaml']);
+      return pyodide;
+    });
+    return pyodidePromise;
+  }
+
+  async function extractAssetsFromRom(romBytes) {
+    setStatus('Loading in-browser Python ROM extractor (first time only)...');
+    const pyodide = await loadPyodideEngine();
+
+    setStatus('Downloading asset extraction scripts...');
+    try { pyodide.FS.mkdirTree('/work/assets/sprites'); } catch (_) {}
+
+    await Promise.all(ASSET_TOOL_FILES.map(async (fname) => {
+      const res = await fetch(`./assets-tool/${fname}`);
+      if (!res.ok) throw new Error(`Missing extractor script: ${fname}`);
+      const data = new Uint8Array(await res.arrayBuffer());
+      pyodide.FS.writeFile(`/work/assets/${fname}`, data);
+    }));
+
+    pyodide.FS.writeFile('/work/zelda3.sfc', new Uint8Array(romBytes));
+
+    setStatus('Extracting game assets from zelda3.sfc (10-20s, runs locally in Chrome)...');
+    // Yield a frame so the UI updates before synchronous Python execution
+    await new Promise((r) => setTimeout(r, 60));
+
+    await pyodide.runPythonAsync(`
+import os, sys, runpy
+os.chdir('/work/assets')
+if '/work/assets' not in sys.path:
+    sys.path.insert(0, '/work/assets')
+sys.argv = ['/work/assets/restool.py', '--extract-from-rom', '-r', '/work/zelda3.sfc']
+runpy.run_path('/work/assets/restool.py', run_name='__main__')
+`);
+
+    const datBytes = pyodide.FS.readFile('/work/zelda3_assets.dat');
+    return new Uint8Array(datBytes);
+  }
+
   async function handleFiles(fileList) {
     for (const file of fileList) {
       const name = file.name.toLowerCase();
@@ -274,8 +345,18 @@ CycleShader = F11
           Module.FS.writeFile('/zelda3.ini', buildIniConfig());
           Module._web_start_game();
           return;
-        } else {
-          setStatus('Raw .sfc ROM detected: please extract zelda3_assets.dat using restool.py (see help below) or drop zelda3_assets.bps first.', true);
+        }
+        try {
+          const datBytes = await extractAssetsFromRom(new Uint8Array(buf));
+          cachedAssets = datBytes;
+          await idbPut('zelda3_assets.dat', cachedAssets).catch(() => {});
+          await checkCachedAssets();
+          setStatus('Assets extracted & saved locally! Starting game...');
+          launchGame(cachedAssets);
+          return;
+        } catch (err) {
+          console.error(err);
+          setStatus(`ROM extraction failed: ${err.message || err}`, true);
         }
       }
     }
@@ -297,6 +378,16 @@ CycleShader = F11
 
   $('btn-play-cached').addEventListener('click', () => {
     if (cachedAssets) launchGame(cachedAssets);
+  });
+
+  $('btn-download-dat').addEventListener('click', () => {
+    if (!cachedAssets) return;
+    const blob = new Blob([cachedAssets], { type: 'application/octet-stream' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'zelda3_assets.dat';
+    a.click();
+    URL.revokeObjectURL(a.href);
   });
 
   $('btn-clear-cached').addEventListener('click', async () => {
