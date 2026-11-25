@@ -154,7 +154,9 @@
     scheduleTopBarFade();
   };
 
+  let lastNativeError = '';
   window.ZeldaOnError = (err) => {
+    lastNativeError = err;
     setStatus(`Error: ${err}`, true);
     showToast(`Error: ${err}`);
   };
@@ -232,6 +234,7 @@ CycleShader = F11
       setStatus('Still loading WebAssembly engine — please wait a moment...');
       return;
     }
+    lastNativeError = '';
     try {
       Module.FS.writeFile('/zelda3_assets.dat', new Uint8Array(assetsBytes));
       if (cachedZspr) {
@@ -241,7 +244,8 @@ CycleShader = F11
       Module._web_start_game();
     } catch (err) {
       console.error(err);
-      setStatus(`Failed to start game: ${err.message || err}`, true);
+      const detail = lastNativeError || (err && err.message) || String(err);
+      setStatus(`Failed to start game: ${detail}`, true);
     }
   }
 

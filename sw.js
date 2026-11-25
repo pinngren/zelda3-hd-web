@@ -1,4 +1,4 @@
-const CACHE_NAME = 'zelda3-hd3d-v2';
+const CACHE_NAME = 'zelda3-hd3d-v3';
 const CORE_ASSETS = [
   './',
   './index.html',
